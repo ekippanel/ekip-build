@@ -1,0 +1,214 @@
+# Ekip Panel merkezi derleyici (bu dosyayı "Önizleme altyapısını kur" yazar; elle düzenlemeyin).
+#
+# Panel, bir projeye push geldiğinde ya da "Test sayfasına al" denince bu iş akışını tetikler.
+# Proje repolarına hiçbir dosya ya da gizli anahtar konmaz; gizli anahtarlar yalnızca bu repoda durur:
+#   SOURCE_TOKEN  organizasyon token'ı (özel proje reposunu okur, ana siteye yazar)
+#   PREVIEW_TOKEN önizleme organizasyonunun token'ı (önizleme sitesine yazar)
+#   HOOK_SECRET   panelin deploy-hook gizi
+#
+# Güvenlik: projenin kodu "build" işinde gizli anahtar OLMADAN çalışır. Kaynak yalnızca ilk adımda
+# token'la çekilir; token o adımın dışına çıkmaz. Siteye yazma ayrı işte, proje kodu çalıştırılmadan yapılır.
+name: Ekip derleyici
+run-name: "${{ inputs.mode }} · ${{ inputs.repo }} · ${{ inputs.sha }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id: { description: "Panel proje id", required: true }
+      repo: { description: "sahip/repo", required: true }
+      sha: { description: "commit", required: true }
+      mode: { description: "web | media | promote | remove", required: true, default: web }
+      site: { description: "main | preview", required: true, default: preview }
+      path: { description: "site içindeki yol (kök için boş)", required: false, default: "" }
+      files: { description: "media: JSON dosya listesi", required: false, default: "[]" }
+      links: { description: "media: JSON bağlantı listesi", required: false, default: "[]" }
+      env_b64: { description: "flutter: .env (yalnızca herkese açık değerler)", required: false, default: "" }
+      title: { description: "Proje adı", required: false, default: "" }
+
+permissions:
+  contents: read
+
+env:
+  MAIN_SITE_REPO: "ekippanel/ekippanel.github.io"
+  MAIN_SITE_URL: "https://ekippanel.github.io"
+  PREVIEW_SITE_REPO: "ekippanel-onizleme/ekippanel-onizleme.github.io"
+  PREVIEW_SITE_URL: "https://ekippanel-onizleme.github.io"
+  HOOK_URL: "https://rrubvknfwuyekemgjnkj.supabase.co/functions/v1/deploy-hook"
+  PANEL_ORIGIN: "https://ekippanel.github.io"
+  PROJECT_ID: ${{ inputs.project_id }}
+  SRC_REPO: ${{ inputs.repo }}
+  SRC_SHA: ${{ inputs.sha }}
+  MODE: ${{ inputs.mode }}
+  SITE: ${{ inputs.site }}
+  SITE_PATH: ${{ inputs.path }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  status:
+    if: inputs.mode == 'web' || inputs.mode == 'media'
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Durum: derleniyor"
+        env:
+          HOOK_SECRET: ${{ secrets.HOOK_SECRET }}
+        run: |
+          curl -fsS -X POST "$HOOK_URL" -H "content-type: application/json" -H "x-deploy-secret: $HOOK_SECRET" \
+            -d "$(jq -n --arg p "$PROJECT_ID" --arg s "$SRC_SHA" --arg r "$RUN_URL" --arg m "$MODE" '{project_id:$p, stage:"building", sha:$s, run_url:$r, mode:$m}')" || true
+
+  build:
+    if: inputs.mode == 'web' || inputs.mode == 'media'
+    needs: status
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      kind: ${{ steps.detect.outputs.kind }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: builder
+          persist-credentials: false
+
+      - name: Kaynağı çek
+        env:
+          TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          git init -q src
+          cd src
+          git remote add origin "https://github.com/${SRC_REPO}.git"
+          git -c http.extraheader="$AUTH" fetch -q --depth 1 origin "$SRC_SHA"
+          git checkout -q FETCH_HEAD
+          if [ -f .gitattributes ] && grep -q "filter=lfs" .gitattributes; then
+            git lfs install --local > /dev/null
+            git -c http.extraheader="$AUTH" lfs pull origin || echo "::warning::LFS dosyaları çekilemedi"
+          fi
+          git remote remove origin
+          rm -rf .git
+
+      - name: Türü bul
+        id: detect
+        run: python3 builder/scripts/detect.py >> "$GITHUB_OUTPUT"
+        env:
+          FILES: ${{ inputs.files }}
+          LINKS: ${{ inputs.links }}
+
+      - uses: subosito/flutter-action@v2
+        if: steps.detect.outputs.kind == 'flutter'
+        with:
+          channel: stable
+          flutter-version: 3.41.x
+          cache: true
+
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.kind == 'node'
+        with:
+          node-version: 22
+
+      - name: Dönüştürme araçları
+        if: steps.detect.outputs.kind == 'media'
+        env:
+          NEED_BLENDER: ${{ steps.detect.outputs.need_blender }}
+          NEED_FFMPEG: ${{ steps.detect.outputs.need_ffmpeg }}
+          NEED_MAGICK: ${{ steps.detect.outputs.need_magick }}
+          NEED_GDOWN: ${{ steps.detect.outputs.need_gdown }}
+        run: bash builder/scripts/tools.sh
+
+      - name: Derle
+        env:
+          FILES: ${{ inputs.files }}
+          LINKS: ${{ inputs.links }}
+          ENV_B64: ${{ inputs.env_b64 }}
+          TITLE: ${{ inputs.title }}
+          KIND: ${{ steps.detect.outputs.kind }}
+        run: bash builder/scripts/build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: out
+          path: out/
+          include-hidden-files: true
+          retention-days: 1
+
+  publish:
+    if: always() && (inputs.mode == 'web' || inputs.mode == 'media') && needs.status.result == 'success'
+    needs: [status, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: builder
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        if: needs.build.result == 'success'
+        with:
+          name: out
+          path: out
+
+      - name: Siteye yaz (test/ + prev/ + _staged/)
+        id: pub
+        if: needs.build.result == 'success'
+        env:
+          TOKEN: ${{ inputs.site == 'main' && secrets.SOURCE_TOKEN || secrets.PREVIEW_TOKEN }}
+        run: bash builder/scripts/publish.sh
+
+      - name: "Durum: test hazır / başarısız"
+        if: always()
+        env:
+          HOOK_SECRET: ${{ secrets.HOOK_SECRET }}
+          OK: ${{ needs.build.result == 'success' && steps.pub.outcome == 'success' }}
+          PREV: ${{ steps.pub.outputs.prev }}
+          KIND: ${{ needs.build.outputs.kind }}
+        run: |
+          STAGE=failed; [ "$OK" = "true" ] && STAGE=test_ready
+          BASE_URL="$PREVIEW_SITE_URL"; [ "$SITE" = "main" ] && BASE_URL="$MAIN_SITE_URL"
+          TEST_URL="$BASE_URL/${SITE_PATH:+$SITE_PATH/}test/"
+          LIVE_URL="$BASE_URL/${SITE_PATH:+$SITE_PATH/}"
+          curl -fsS -X POST "$HOOK_URL" -H "content-type: application/json" -H "x-deploy-secret: $HOOK_SECRET" \
+            -d "$(jq -n --arg p "$PROJECT_ID" --arg st "$STAGE" --arg s "$SRC_SHA" --arg t "$TEST_URL" --arg l "$LIVE_URL" \
+                  --arg r "$RUN_URL" --arg m "$MODE" --arg k "$KIND" --arg pv "${PREV:-}" \
+                  '{project_id:$p, stage:$st, sha:$s, test_url:$t, live_url_planned:$l, run_url:$r, mode:$m, kind:$k, prev:($pv=="1")}')" || true
+
+  promote:
+    if: inputs.mode == 'promote'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: builder
+          persist-credentials: false
+
+      - name: Canlıya al (_staged/ → canlı)
+        id: promote
+        env:
+          TOKEN: ${{ inputs.site == 'main' && secrets.SOURCE_TOKEN || secrets.PREVIEW_TOKEN }}
+        run: bash builder/scripts/promote.sh
+
+      - name: "Durum: canlıda"
+        if: always()
+        env:
+          HOOK_SECRET: ${{ secrets.HOOK_SECRET }}
+          OK: ${{ steps.promote.outcome == 'success' }}
+          LIVE_SHA: ${{ steps.promote.outputs.sha }}
+        run: |
+          STAGE=failed; [ "$OK" = "true" ] && STAGE=live
+          BASE_URL="$PREVIEW_SITE_URL"; [ "$SITE" = "main" ] && BASE_URL="$MAIN_SITE_URL"
+          LIVE_URL="$BASE_URL/${SITE_PATH:+$SITE_PATH/}"
+          curl -fsS -X POST "$HOOK_URL" -H "content-type: application/json" -H "x-deploy-secret: $HOOK_SECRET" \
+            -d "$(jq -n --arg p "$PROJECT_ID" --arg st "$STAGE" --arg s "${LIVE_SHA:-}" --arg l "$LIVE_URL" --arg r "$RUN_URL" \
+                  '{project_id:$p, stage:$st, sha:$s, live_url:$l, run_url:$r, mode:"promote"}')" || true
+
+  remove:
+    if: inputs.mode == 'remove'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: builder
+          persist-credentials: false
+
+      - name: Önizlemeyi kaldır (askıya alınan proje)
+        env:
+          TOKEN: ${{ inputs.site == 'main' && secrets.SOURCE_TOKEN || secrets.PREVIEW_TOKEN }}
+        run: bash builder/scripts/remove.sh

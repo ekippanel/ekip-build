@@ -1,0 +1,41 @@
+# Site repolarının geçmişini haftada bir tek commit'e indirir: her derleme birkaç MB eklediği için
+# geçmiş birikirse repo şişer ve Pages yavaşlar. İçerik değişmez, yalnızca eski sürümlerin geçmişi silinir.
+name: Site geçmişini sıkıştır
+
+on:
+  schedule:
+    - cron: "23 2 * * 0"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  squash:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        site: [main, preview]
+    steps:
+      - name: Sıkıştır
+        env:
+          TOKEN: ${{ matrix.site == 'main' && secrets.SOURCE_TOKEN || secrets.PREVIEW_TOKEN }}
+          SITE_REPO: ${{ matrix.site == 'main' && 'ekippanel/ekippanel.github.io' || 'ekippanel-onizleme/ekippanel-onizleme.github.io' }}
+        run: |
+          set -euo pipefail
+          case "$SITE_REPO" in ""|__*) echo "Site ayarlı değil, atlandı"; exit 0 ;; esac
+          [ -n "$TOKEN" ] || { echo "Token yok, atlandı"; exit 0; }
+          for i in 1 2 3; do
+            rm -rf site
+            git clone -q --depth 1 "https://x-access-token:${TOKEN}@github.com/${SITE_REPO}.git" site
+            cd site
+            BR="$(git rev-parse --abbrev-ref HEAD)"; OLD="$(git rev-parse HEAD)"
+            git config user.name "ekip-panel-bot"; git config user.email "bot@ekippanel.local"
+            git checkout -q --orphan squashed
+            git add -A
+            git commit -q -m "Site (geçmiş sıkıştırıldı $(date -u +%F))"
+            if git push -q --force-with-lease="$BR:$OLD" origin "squashed:$BR"; then echo "Tamam"; exit 0; fi
+            cd ..
+            sleep 20
+          done
+          echo "::warning::Sıkıştırma yapılamadı (eş zamanlı derleme); gelecek hafta tekrar denenecek"

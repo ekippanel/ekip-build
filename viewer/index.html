@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Önizleme</title>
+  <meta name="robots" content="noindex">
+  <link rel="stylesheet" href="viewer.css">
+</head>
+<body>
+  <header class="top">
+    <div class="title">
+      <strong id="title">Önizleme</strong>
+      <span id="meta" class="muted"></span>
+    </div>
+    <div class="actions">
+      <label id="compareWrap" class="toggle" hidden>
+        <input type="checkbox" id="compare"> Önceki sürümle karşılaştır
+      </label>
+    </div>
+  </header>
+  <nav id="items" class="items" aria-label="Öğeler"></nav>
+  <main id="stage" class="stage"><p class="muted center">Yükleniyor…</p></main>
+  <footer class="bar">
+    <div id="hint" class="muted"></div>
+    <div class="bar-actions">
+      <button id="pinMode" class="btn" hidden>📍 Noktaya not koy</button>
+      <button id="anchorBtn" class="btn primary" hidden>📍 Buraya not ekle</button>
+    </div>
+  </footer>
+  <details id="warnings" class="warnings" hidden><summary>Uyarılar</summary><ul id="warnList"></ul></details>
+  <script src="viewer.js"></script>
+</body>
+</html>
